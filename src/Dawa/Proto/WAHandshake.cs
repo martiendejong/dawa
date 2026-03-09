@@ -71,7 +71,7 @@ public sealed class HandshakeMessage
         var buf = new List<byte>();
         if (ClientHello  != null) ProtoEncoder.WriteMessage(buf, 2, ClientHello.ToByteArray());
         if (ServerHello  != null) { /* server-only */ }
-        if (ClientFinish != null) ProtoEncoder.WriteMessage(buf, 5, ClientFinish.ToByteArray());
+        if (ClientFinish != null) ProtoEncoder.WriteMessage(buf, 4, ClientFinish.ToByteArray()); // field 4, not 5!
         return [.. buf];
     }
 
@@ -86,7 +86,7 @@ public sealed class HandshakeMessage
             {
                 case 2: msg.ClientHello  = ParseClientHello(r.ReadBytes());  break;
                 case 3: msg.ServerHello  = ServerHello.ParseFrom(r.ReadBytes()); break;
-                case 5: msg.ClientFinish = ParseClientFinish(r.ReadBytes()); break;
+                case 4: msg.ClientFinish = ParseClientFinish(r.ReadBytes()); break;
                 default: r.Skip(wire); break;
             }
         }

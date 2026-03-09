@@ -29,11 +29,35 @@ public sealed class FrameSocket : IAsyncDisposable
         _ws.Options.SetRequestHeader("Origin", "https://web.whatsapp.com");
         _ws.Options.SetRequestHeader("Host", "web.whatsapp.com");
         _ws.Options.SetRequestHeader("User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36");
+        _ws.Options.SetRequestHeader("Accept-Language", "en-US,en;q=0.9");
+        _ws.Options.SetRequestHeader("Cache-Control", "no-cache");
+        _ws.Options.SetRequestHeader("Pragma", "no-cache");
+        // Sub-protocol is required by WhatsApp's server
+        _ws.Options.AddSubProtocol("chat");
+        _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(25);
 
         await _ws.ConnectAsync(new Uri(url ?? WA_URL), ct);
         _logger.LogInformation("FrameSocket: WebSocket connected to {Url}", url ?? WA_URL);
+    }
+
+    /// <summary>Sends raw bytes directly to the WebSocket without any framing.</summary>
+    public async Task SendRawAsync(byte[] data, CancellationToken ct = default)
+    {
+        if (_ws == null || _ws.State != WebSocketState.Open)
+            throw new InvalidOperationException("WebSocket not connected.");
+
+        await _sendLock.WaitAsync(ct);
+        try
+        {
+            await _ws.SendAsync(data, WebSocketMessageType.Binary, true, ct);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+
+        _logger.LogDebug("FrameSocket: Sent raw {Length} bytes", data.Length);
     }
 
     /// <summary>Sends a frame: 3-byte BE length + payload.</summary>

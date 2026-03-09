@@ -18,8 +18,9 @@ namespace Dawa.Noise;
 /// </summary>
 public sealed class NoiseProcessor : IAsyncDisposable
 {
-    // WhatsApp prologue bytes: "WA" + protocol version
-    private static readonly byte[] WA_PROLOGUE = [0x57, 0x41, 0x05, 0x02];
+    // WhatsApp prologue bytes: "WA" + protocol version 6 + dict version 3
+    // Source: Baileys NOISE_WA_HEADER = Buffer.from([87, 65, 6, DICT_VERSION]) where DICT_VERSION=3
+    private static readonly byte[] WA_PROLOGUE = [0x57, 0x41, 0x06, 0x03];
 
     private readonly FrameSocket _socket;
     private readonly AuthState _auth;
@@ -60,12 +61,13 @@ public sealed class NoiseProcessor : IAsyncDisposable
     {
         var noise = new NoiseState();
 
-        // Mix prologue into hash
+        // WhatsApp's modified Noise XX initialization (matches Baileys noise-handler.js):
+        // 1. Mix prologue (WA header bytes: "WA" + version 6 + dict 3)
         noise.MixHash(WA_PROLOGUE);
-        noise.MixHash(_auth.NoiseKeyPublic);  // static public key as part of prologue
+        // 2. Mix OUR ephemeral public key (NOT the static noise key — Baileys does this at init)
+        noise.MixHash(_ephemeralPub);
 
         // ── Phase 1: Send ClientHello with our ephemeral key ──────────────────
-        noise.MixHash(_ephemeralPub);
 
         var clientHello = new ClientHello { Ephemeral = _ephemeralPub };
         var handshake1 = new HandshakeMessage { ClientHello = clientHello };
@@ -128,7 +130,9 @@ public sealed class NoiseProcessor : IAsyncDisposable
         _recvCounter = 0;
         _handshakeDone = true;
 
-        _logger.LogInformation("Noise: Handshake complete. Transport keys established.");
+        _logger.LogInformation("Noise: Handshake complete. Transport keys established. sendKey[0..4]={S} recvKey[0..4]={R}",
+            BitConverter.ToString(_sendKey, 0, 4),
+            BitConverter.ToString(_recvKey, 0, 4));
 
         // Now handle the post-handshake authentication (QR or session restore)
         await HandlePostHandshakeAsync(ct);
@@ -136,58 +140,19 @@ public sealed class NoiseProcessor : IAsyncDisposable
 
     // ─── Post-Handshake Auth ────────────────────────────────────────────────
 
-    private async Task HandlePostHandshakeAsync(CancellationToken ct)
+    private Task HandlePostHandshakeAsync(CancellationToken ct)
     {
-        // The server will send us a "stream:features" or similar to start the session.
-        // For a fresh connection, we need to request QR code or restore the session.
-
+        // After the Noise handshake + ClientFinish, the server drives the flow.
+        // For fresh connections: server processes our devicePairingData from ClientPayload,
+        //   then sends an IQ pair-device with QR ref.
+        // For existing sessions: server acknowledges the session via "success" or "stream:features".
+        // We just start listening — no proactive sends needed here.
         if (_auth.IsFresh)
-        {
-            _logger.LogInformation("Fresh session — requesting QR code pairing.");
-            await RequestPairingAsync(ct);
-        }
+            _logger.LogInformation("Fresh session — waiting for server QR pair-device IQ.");
         else
-        {
-            _logger.LogInformation("Restoring existing session for {Me}", _auth.Me?.Id);
-            await RestoreSessionAsync(ct);
-        }
-    }
+            _logger.LogInformation("Restoring session for {Me}", _auth.Me?.Id);
 
-    private async Task RequestPairingAsync(CancellationToken ct)
-    {
-        // Send a "pair" IQ to get QR code ref from server
-        var msgId = GenerateMessageId();
-        var iqNode = new BinaryNode("iq", new()
-        {
-            ["id"] = msgId,
-            ["type"] = "set",
-            ["xmlns"] = "md",
-            ["to"] = "@s.whatsapp.net",
-        }, new List<BinaryNode>
-        {
-            new("pair-device", new()
-            {
-                ["ref-key"] = Convert.ToBase64String(_auth.AdvSecretKey),
-            })
-        });
-
-        await SendNodeAsync(iqNode, ct);
-        _logger.LogDebug("Sent pair-device IQ ({Id})", msgId);
-    }
-
-    private async Task RestoreSessionAsync(CancellationToken ct)
-    {
-        // Send passive connect to restore session
-        var msgId = GenerateMessageId();
-        var iqNode = new BinaryNode("iq", new()
-        {
-            ["id"] = msgId,
-            ["type"] = "get",
-            ["xmlns"] = "account",
-            ["to"] = "s.whatsapp.net",
-        });
-
-        await SendNodeAsync(iqNode, ct);
+        return Task.CompletedTask;
     }
 
     // ─── Receive loop ───────────────────────────────────────────────────────
@@ -414,11 +379,31 @@ public sealed class NoiseProcessor : IAsyncDisposable
         await _socket.SendFrameAsync(encrypted, ct);
     }
 
+    private bool _firstHandshakeFrame = true;
+
     private async Task SendHandshakeMessageAsync(HandshakeMessage msg, CancellationToken ct)
     {
-        // During handshake, frames are NOT yet encrypted — send as-is
-        var bytes = msg.ToByteArray();
-        await _socket.SendFrameAsync(bytes, ct);
+        var msgBytes = msg.ToByteArray();
+
+        if (_firstHandshakeFrame)
+        {
+            // Baileys wire format for the FIRST frame:
+            //   [WA_PROLOGUE: 4 bytes] [length: 3 bytes BE] [proto payload: N bytes]
+            // The WA prologue is OUTSIDE the 3-byte length framing (unlike subsequent frames).
+            var raw = new byte[WA_PROLOGUE.Length + 3 + msgBytes.Length];
+            WA_PROLOGUE.CopyTo(raw, 0);
+            raw[4] = (byte)(msgBytes.Length >> 16);
+            raw[5] = (byte)(msgBytes.Length >> 8);
+            raw[6] = (byte)(msgBytes.Length);
+            msgBytes.CopyTo(raw, 7);
+            await _socket.SendRawAsync(raw, ct);
+            _firstHandshakeFrame = false;
+        }
+        else
+        {
+            // Subsequent frames: standard [3-byte len][payload]
+            await _socket.SendFrameAsync(msgBytes, ct);
+        }
     }
 
     private byte[] EncryptFrame(byte[] data)
@@ -437,33 +422,85 @@ public sealed class NoiseProcessor : IAsyncDisposable
 
     // ─── Helpers ────────────────────────────────────────────────────────────
 
+    // Baileys default version: [2, 3000, 1015920]
+    // buildHash = MD5("2.3000.1015920")
+    private const string WA_VERSION = "2.3000.1015920";
+
     private byte[] BuildClientPayload()
     {
-        var payload = new ClientPayload
+        var userAgent = new UserAgent
         {
-            Passive = !_auth.IsFresh,
-            UserAgent = new UserAgent
-            {
-                AppVersion = new AppVersion { Primary = 2, Secondary = 3000, Tertiary = 1017531287 },
-                Platform = 14, // WEB
-                OsVersion = "0.1",
-                Device = "Desktop",
-                Manufacturer = "",
-                Mcc = "000",
-                Mnc = "000",
-                LocaleLanguageIso6391 = "en",
-                LocaleCountryIso31661Alpha2 = "en",
-            },
-            WebInfo = new WebInfo { WebSubPlatform = 0 },
+            Platform = 14, // WEB
+            AppVersion = new AppVersion { Primary = 2, Secondary = 3000, Tertiary = 1015920 },
+            Mcc = "000",
+            Mnc = "000",
+            OsVersion = "0.1",
+            Device = "Chrome",    // Baileys browser[1] = "Chrome" (Browsers.ubuntu('Chrome'))
+            OsBuildNumber = "0.1",
+            LocaleLanguageIso6391 = "en",
+            LocaleCountryIso31661Alpha2 = "US",
         };
 
-        if (!_auth.IsFresh && _auth.Me != null)
+        if (_auth.IsFresh)
         {
-            if (ulong.TryParse(_auth.Me.Id.Split('@')[0], out var userId))
-                payload.Username = userId;
-        }
+            // Fresh registration: include device pairing data so server knows our keys
+            var buildHash = MD5.HashData(System.Text.Encoding.UTF8.GetBytes(WA_VERSION));
 
-        return payload.ToByteArray();
+            // Registration ID as 4-byte big-endian
+            var eRegid = new byte[4];
+            eRegid[0] = (byte)(_auth.RegistrationId >> 24);
+            eRegid[1] = (byte)(_auth.RegistrationId >> 16);
+            eRegid[2] = (byte)(_auth.RegistrationId >> 8);
+            eRegid[3] = (byte)(_auth.RegistrationId);
+
+            // Signed pre-key ID as 3-byte big-endian
+            var eSkeyId = new byte[3];
+            eSkeyId[0] = (byte)(_auth.SignedPreKeyId >> 16);
+            eSkeyId[1] = (byte)(_auth.SignedPreKeyId >> 8);
+            eSkeyId[2] = (byte)(_auth.SignedPreKeyId);
+
+            var deviceProps = new DevicePropsMessage
+            {
+                Os = "Windows",
+                PlatformType = 1, // CHROME
+            }.ToByteArray();
+
+            return new ClientPayload
+            {
+                Passive = false,
+                Pull = false,
+                ConnectType = 1,   // WIFI_UNKNOWN
+                ConnectReason = 1, // USER_ACTIVATED
+                UserAgent = userAgent,
+                WebInfo = new WebInfo { WebSubPlatform = 0 },
+                DevicePairingData = new DevicePairingRegistrationData
+                {
+                    ERegid   = eRegid,
+                    EKeytype = [5], // KEY_BUNDLE_TYPE
+                    EIdent   = _auth.SignedIdentityKeyPublic,
+                    ESkeyId  = eSkeyId,
+                    ESkeyVal = _auth.SignedPreKeyPublic,
+                    ESkeySig = _auth.SignedPreKeySignature,
+                    BuildHash   = buildHash,
+                    DeviceProps = deviceProps,
+                },
+            }.ToByteArray();
+        }
+        else
+        {
+            // Session restore (login)
+            ulong.TryParse(_auth.Me?.Id.Split('@')[0] ?? "0", out var userId);
+            return new ClientPayload
+            {
+                Username = userId,
+                Passive = true,
+                Pull = true,
+                ConnectType = 1,
+                ConnectReason = 1,
+                UserAgent = userAgent,
+                WebInfo = new WebInfo { WebSubPlatform = 0 },
+            }.ToByteArray();
+        }
     }
 
     private static string GenerateMessageId()

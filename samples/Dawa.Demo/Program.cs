@@ -12,7 +12,7 @@ PrintBanner();
 // ─── Logging (only warnings from internals, we handle output ourselves) ──────
 using var loggerFactory = LoggerFactory.Create(b => b
     .AddConsole()
-    .SetMinimumLevel(LogLevel.Warning));
+    .SetMinimumLevel(LogLevel.Debug));
 
 // ─── Client setup ─────────────────────────────────────────────────────────────
 var sessionDir = Path.Combine(AppContext.BaseDirectory, "demo-session");

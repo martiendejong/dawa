@@ -46,11 +46,33 @@ public static class ProtoEncoder
         buf.Add(1);
     }
 
+    /// <summary>Force-writes bool even when false (Baileys always emits default values).</summary>
+    public static void WriteBoolAlways(List<byte> buf, int field, bool value)
+    {
+        WriteTag(buf, field, 0);
+        buf.Add(value ? (byte)1 : (byte)0);
+    }
+
     public static void WriteInt32(List<byte> buf, int field, int value)
     {
         if (value == 0) return;
         WriteTag(buf, field, 0);
         WriteVarint(buf, (ulong)(uint)value);
+    }
+
+    /// <summary>Force-writes int even when zero (Baileys always emits default values).</summary>
+    public static void WriteInt32Always(List<byte> buf, int field, int value)
+    {
+        WriteTag(buf, field, 0);
+        WriteVarint(buf, (ulong)(uint)value);
+    }
+
+    /// <summary>Force-writes a sub-message even when the payload is empty.</summary>
+    public static void WriteMessageAlways(List<byte> buf, int field, byte[] serialized)
+    {
+        WriteTag(buf, field, 2);
+        WriteVarint(buf, (ulong)serialized.Length);
+        buf.AddRange(serialized);
     }
 
     public static void WriteUInt32(List<byte> buf, int field, uint value)

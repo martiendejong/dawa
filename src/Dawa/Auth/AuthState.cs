@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text.Json.Serialization;
 using Dawa.Crypto;
+using System.Text.Json;
 
 namespace Dawa.Auth;
 
@@ -94,10 +95,10 @@ public sealed class AuthState
 
     private static byte[] SignPreKey(byte[] identityPriv, byte[] preKeyPub)
     {
-        // WhatsApp uses Ed25519 for signing — simplified placeholder
-        // In a full implementation use Ed25519 signing with BouncyCastle
-        using var hmac = new System.Security.Cryptography.HMACSHA256(identityPriv);
-        return hmac.ComputeHash(preKeyPub);
+        // XEdDSA: uses the Curve25519 identity private key directly as an Ed25519 scalar.
+        // This matches Baileys / Signal's curve25519-js curve25519_sign() behaviour.
+        // Returns a 64-byte signature (R ‖ s).
+        return XEdDSA.Sign(identityPriv, preKeyPub);
     }
 }
 
