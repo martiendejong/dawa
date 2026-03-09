@@ -1,0 +1,30 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.DotSettings
+TestResults/
+*.nupkg
+*.snupkg
+packages/
+
+## Session data (never commit credentials)
+**/wa-session/
+**/whatsapp-session/
+**/*-session/
+creds.json
+
+## Build artifacts
+artifacts/
+publish/
+
+## Rider / VS Code
+.idea/
+.vscode/
+*.editorconfig
+
+## OS
+.DS_Store
+Thumbs.db
