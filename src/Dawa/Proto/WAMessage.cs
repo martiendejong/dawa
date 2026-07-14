@@ -64,7 +64,9 @@ public sealed class DevicePairingRegistrationData
 /// <summary>DeviceProps (companion registration info), field 8 of DevicePairingRegistrationData.</summary>
 public sealed class DevicePropsMessage
 {
-    public string Os             { get; set; } = "Windows";
+    // Baileys' DEFAULT_ORIGIN presents as Macintosh to blend with the expected
+    // browser user agents; WhatsApp fingerprints on this (869ceb3w5).
+    public string Os             { get; set; } = "Macintosh";
     // PlatformType: CHROME=1
     public int PlatformType      { get; set; } = 1;
     public bool RequireFullSync  { get; set; } = false;

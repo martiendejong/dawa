@@ -42,9 +42,14 @@ public sealed class NoiseState
     /// <summary>Mixes input key material into the chaining key and optionally sets a new cipher key.</summary>
     public void MixKey(byte[] inputKeyMaterial)
     {
-        // HKDF output: first 32 bytes = new encryption key (k), second 32 bytes = new chaining key (ck).
-        // Matches Baileys: encKey = hashOutput.slice(0, 32), salt = hashOutput.slice(32)
-        var (k, ck) = DawaHKDF.DeriveKeys(inputKeyMaterial, _ck);
+        // HKDF output: first 32 bytes = new chaining key (ck), second 32 bytes = new encryption key (k).
+        // Verified against Baileys noise-handler.ts localHKDF + mixIntoKey:
+        //   const [write, read] = localHKDF(data)  // [output[0:32], output[32:64]]
+        //   salt = write   // salt IS the chaining key
+        //   encKey = read
+        // The prior comment/assignment had these swapped, producing wrong transport
+        // keys and the AuthenticationTagMismatch crash during the handshake (869ceb2e8).
+        var (ck, k) = DawaHKDF.DeriveKeys(inputKeyMaterial, _ck);
         _ck = ck;
         _k = k;
         _n = 0;

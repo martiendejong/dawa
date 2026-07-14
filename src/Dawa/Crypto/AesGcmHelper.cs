@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 
 namespace Dawa.Crypto;
@@ -114,11 +115,13 @@ public static class AesGcmHelper
 
     private static byte[] CounterToNonce(ulong counter)
     {
-        // 12-byte nonce: 4 zero bytes + 8-byte big-endian counter
+        // 12-byte nonce: 8 zero bytes + 4-byte big-endian uint32 counter in the LAST 4 bytes.
+        // Verified against Baileys noise-handler.ts generateIV:
+        //   new DataView(iv).setUint32(8, counter)   // uint32 (big-endian) at offset 8
+        // The prior code wrote an 8-byte counter at offset 4, which does not match WhatsApp's
+        // transport nonce and broke GCM decryption (869ceb2uw).
         var nonce = new byte[NonceSize];
-        var counterBytes = BitConverter.GetBytes(counter);
-        if (BitConverter.IsLittleEndian) Array.Reverse(counterBytes);
-        counterBytes.CopyTo(nonce, 4);
+        BinaryPrimitives.WriteUInt32BigEndian(nonce.AsSpan(8), (uint)counter);
         return nonce;
     }
 }

@@ -95,10 +95,25 @@ public sealed class AuthState
 
     private static byte[] SignPreKey(byte[] identityPriv, byte[] preKeyPub)
     {
-        // XEdDSA: uses the Curve25519 identity private key directly as an Ed25519 scalar.
-        // This matches Baileys / Signal's curve25519-js curve25519_sign() behaviour.
-        // Returns a 64-byte signature (R ‖ s).
-        return XEdDSA.Sign(identityPriv, preKeyPub);
+        // WhatsApp/Signal sign the DJB-type-prefixed public key, not the raw 32-byte key.
+        // Verified against Baileys crypto.ts signedKeyPair:
+        //   const pubKey = generateSignalPubKey(preKey.public) // prepends 0x05 -> 33 bytes
+        //   const signature = Curve.sign(identityKeyPair.private, pubKey)
+        // generateSignalPubKey is a no-op when the key is already 33 bytes (869ceb2jp).
+        byte[] message;
+        if (preKeyPub.Length == 33)
+        {
+            message = preKeyPub;
+        }
+        else
+        {
+            message = new byte[33];
+            message[0] = 0x05; // KEY_BUNDLE_TYPE (Curve25519 DJB type byte)
+            Buffer.BlockCopy(preKeyPub, 0, message, 1, 32);
+        }
+        // XEdDSA: uses the Curve25519 identity private key directly as an Ed25519 scalar,
+        // matching Baileys / Signal's curve25519-js curve25519_sign(). Returns 64 bytes (R ‖ s).
+        return XEdDSA.Sign(identityPriv, message);
     }
 }
 
