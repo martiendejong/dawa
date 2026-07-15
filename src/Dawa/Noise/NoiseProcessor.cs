@@ -425,15 +425,15 @@ public sealed class NoiseProcessor : IAsyncDisposable
     // WhatsApp Web client version. WA may reject clients that are too old, so this
     // tracks the current Baileys default (869ceb2t7). NOTE: this is a moving target —
     // verify it is still current at test time against Baileys' Defaults WA_VERSION.
-    // buildHash = MD5("2.3000.1033846690")
-    private const string WA_VERSION = "2.3000.1033846690";
+    // buildHash = MD5("2.3000.1035194821")  (Baileys Defaults baileys-version.json, checked 2026-07-15)
+    private const string WA_VERSION = "2.3000.1035194821";
 
     private byte[] BuildClientPayload()
     {
         var userAgent = new UserAgent
         {
             Platform = 14, // WEB
-            AppVersion = new AppVersion { Primary = 2, Secondary = 3000, Tertiary = 1033846690 },
+            AppVersion = new AppVersion { Primary = 2, Secondary = 3000, Tertiary = 1035194821 },
             Mcc = "000",
             Mnc = "000",
             OsVersion = "0.1",
@@ -461,13 +461,27 @@ public sealed class NoiseProcessor : IAsyncDisposable
             eSkeyId[1] = (byte)(_auth.SignedPreKeyId >> 8);
             eSkeyId[2] = (byte)(_auth.SignedPreKeyId);
 
-            var deviceProps = new DevicePropsMessage
+            // Use the DevicePropsMessage default os (Macintosh, 869ceb3w5); the previous
+            // hard-coded Os="Windows" here silently overrode that fix on the one code
+            // path that actually ships in the registration payload.
+            var devicePropsMsg = new DevicePropsMessage
             {
-                Os = "Windows",
                 PlatformType = 1, // CHROME
-            }.ToByteArray();
+            };
+            var deviceProps = devicePropsMsg.ToByteArray();
 
-            return new ClientPayload
+            var pairing = new DevicePairingRegistrationData
+            {
+                ERegid   = eRegid,
+                EKeytype = [5], // KEY_BUNDLE_TYPE
+                EIdent   = _auth.SignedIdentityKeyPublic,
+                ESkeyId  = eSkeyId,
+                ESkeyVal = _auth.SignedPreKeyPublic,
+                ESkeySig = _auth.SignedPreKeySignature,
+                BuildHash   = buildHash,
+                DeviceProps = deviceProps,
+            };
+            var payload = new ClientPayload
             {
                 Passive = false,
                 Pull = false,
@@ -475,18 +489,32 @@ public sealed class NoiseProcessor : IAsyncDisposable
                 ConnectReason = 1, // USER_ACTIVATED
                 UserAgent = userAgent,
                 WebInfo = new WebInfo { WebSubPlatform = 0 },
-                DevicePairingData = new DevicePairingRegistrationData
-                {
-                    ERegid   = eRegid,
-                    EKeytype = [5], // KEY_BUNDLE_TYPE
-                    EIdent   = _auth.SignedIdentityKeyPublic,
-                    ESkeyId  = eSkeyId,
-                    ESkeyVal = _auth.SignedPreKeyPublic,
-                    ESkeySig = _auth.SignedPreKeySignature,
-                    BuildHash   = buildHash,
-                    DeviceProps = deviceProps,
-                },
+                DevicePairingData = pairing,
             }.ToByteArray();
+
+            // 869e513va: WhatsApp closes the connection after a successful handshake if it
+            // rejects this registration ClientPayload. Log the exact fields + wire bytes so
+            // they can be diffed against Baileys' generateRegistrationNode. Debug-level, so
+            // it stays silent in normal runs.
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                _logger.LogDebug(
+                    "RegPayload: waVersion={V} buildHash={BH} regId={RID} skeyId={SID} os={OS} platformType={PT} " +
+                    "eIdent[{IL}] eSkeyVal[{SVL}] eSkeySig[{SSL}] deviceProps[{DPL}]={DPHEX} clientPayload[{CPL}]={CPHEX}",
+                    WA_VERSION,
+                    Convert.ToHexString(buildHash),
+                    _auth.RegistrationId,
+                    _auth.SignedPreKeyId,
+                    devicePropsMsg.Os,
+                    devicePropsMsg.PlatformType,
+                    _auth.SignedIdentityKeyPublic.Length,
+                    _auth.SignedPreKeyPublic.Length,
+                    _auth.SignedPreKeySignature.Length,
+                    deviceProps.Length, Convert.ToHexString(deviceProps),
+                    payload.Length, Convert.ToHexString(payload));
+            }
+
+            return payload;
         }
         else
         {

@@ -177,7 +177,7 @@ public class HandshakeCryptoTests
         var field = typeof(NoiseProcessor).GetField("WA_VERSION",
             BindingFlags.NonPublic | BindingFlags.Static);
         Assert.NotNull(field);
-        Assert.Equal("2.3000.1033846690", (string?)field!.GetRawConstantValue());
+        Assert.Equal("2.3000.1035194821", (string?)field!.GetRawConstantValue());
     }
 
     private static bool ContainsSequence(byte[] haystack, byte[] needle)
