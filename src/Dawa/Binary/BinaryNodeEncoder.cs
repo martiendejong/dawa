@@ -10,6 +10,10 @@ public static class BinaryNodeEncoder
     public static byte[] Encode(BinaryNode node)
     {
         var ms = new MemoryStream();
+        // WhatsApp frames a node as [1 flag byte][node bytes]; 0x00 = uncompressed.
+        // Baileys' encodeBinaryNode seeds its buffer with [0] for the same reason. The
+        // decoder strips this byte, so a node sent without it desyncs the peer (869e51uxu).
+        ms.WriteByte(0x00);
         WriteNode(ms, node);
         return ms.ToArray();
     }

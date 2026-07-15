@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Text;
 
 namespace Dawa.Binary;
@@ -9,7 +10,29 @@ public static class BinaryNodeDecoder
 {
     public static BinaryNode Decode(byte[] data)
     {
-        var reader = new BinaryReader(data);
+        // WhatsApp frames a binary node as [1 flag byte][node bytes]. The flag's bit 1
+        // (0x02) means the node bytes are zlib-compressed. Matches Baileys
+        // decompressingIfRequired: always strip byte 0, inflate the rest when 2 & flag.
+        // Without this the flag byte (typically 0x00) is read as part of the node and the
+        // decoder desyncs one byte in, later throwing "Unexpected string tag" (869e51uxu).
+        if (data.Length == 0)
+            throw new InvalidDataException("Empty binary frame.");
+
+        byte[] body;
+        if ((data[0] & 0x02) != 0)
+        {
+            using var input = new MemoryStream(data, 1, data.Length - 1);
+            using var zlib = new ZLibStream(input, CompressionMode.Decompress);
+            using var output = new MemoryStream();
+            zlib.CopyTo(output);
+            body = output.ToArray();
+        }
+        else
+        {
+            body = data[1..];
+        }
+
+        var reader = new BinaryReader(body);
         return ReadNode(ref reader);
     }
 
