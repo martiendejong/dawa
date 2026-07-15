@@ -112,14 +112,19 @@ public static class BinaryNodeEncoder
             return;
         }
 
-        // Check if it's a JID (user@server)
+        // JID (user@server). Detect the '@' anywhere INCLUDING position 0 — server JIDs
+        // like "@s.whatsapp.net" have an empty user and must still be encoded as a
+        // JID_PAIR (empty user -> LIST_EMPTY), matching Baileys writeJid. Encoding such a
+        // JID as a raw string makes WhatsApp reject the stanza with a stream:error
+        // (this was breaking the pair-device ack, 869e51uxu). Device JIDs (user:device@server)
+        // are left to the raw path for now — the pairing/ack flow only uses bare server JIDs.
         var atIdx = value.IndexOf('@');
-        if (atIdx > 0)
+        if (atIdx >= 0 && !value.Contains(':'))
         {
             var user = value[..atIdx];
             var server = value[(atIdx + 1)..];
             s.WriteByte(WATags.JidPair);
-            WriteString(s, user);
+            WriteString(s, user); // empty user -> ListEmpty (WriteString handles "")
             WriteString(s, server);
             return;
         }

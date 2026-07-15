@@ -237,41 +237,56 @@ public sealed class NoiseProcessor : IAsyncDisposable
         }
         else if (type == "set")
         {
-            // Server is initiating a request (e.g., pair-device from server side)
+            // Server-initiated pair-device: ack it, then emit the QR (Baileys
+            // CB:iq,type:set,pair-device). The ack must go to the bare server JID
+            // '@s.whatsapp.net' (Baileys S_WHATSAPP_NET), NOT the stanza's from.
             var pairDevice = iq.FindChild("pair-device");
             if (pairDevice != null)
             {
-                // Respond with an ack
                 var ack = new BinaryNode("iq", new()
                 {
-                    ["id"] = iq.GetAttr("id") ?? "",
+                    ["to"] = "@s.whatsapp.net",
                     ["type"] = "result",
-                    ["to"] = iq.GetAttr("from") ?? "s.whatsapp.net",
+                    ["id"] = iq.GetAttr("id") ?? "",
                 });
                 await SendNodeAsync(ack, ct);
+                await HandlePairDeviceResultAsync(pairDevice, ct);
             }
         }
     }
 
-    private async Task HandlePairDeviceResultAsync(BinaryNode pairDevice, CancellationToken ct)
+    private Task HandlePairDeviceResultAsync(BinaryNode pairDevice, CancellationToken ct)
     {
-        // Extract ref token from server
+        // The pair-device node carries one or more <ref> children (the server rotates
+        // them). Emit the QR for the first; content is raw bytes, not a string.
         var refNode = pairDevice.FindChild("ref");
-        if (refNode?.Text == null) return;
-
-        var ref_ = refNode.Text;
-        var qrParts = new[]
+        var refText = RefText(refNode);
+        if (refText == null)
         {
-            ref_,
+            _logger.LogWarning("pair-device had no usable <ref>.");
+            return Task.CompletedTask;
+        }
+
+        // Classic linked-device QR payload: ref,noiseKeyB64,identityKeyB64,advSecretB64.
+        // (Some Baileys builds prefix a wa.me URL + companion platform id; if the phone
+        //  rejects this form at scan time, switch to that variant.)
+        var qrString = string.Join(",",
+            refText,
             Convert.ToBase64String(_auth.NoiseKeyPublic),
             Convert.ToBase64String(_auth.SignedIdentityKeyPublic),
-            Convert.ToBase64String(_auth.AdvSecretKey),
-        };
-        var qrString = string.Join(",", qrParts);
+            Convert.ToBase64String(_auth.AdvSecretKey));
 
-        _logger.LogInformation("QR Code ready for scanning.");
+        _logger.LogInformation("QR code ready for scanning.");
         QRCodeGenerated?.Invoke(this, qrString);
+        return Task.CompletedTask;
     }
+
+    private static string? RefText(BinaryNode? refNode) => refNode?.Content switch
+    {
+        byte[] b => Encoding.UTF8.GetString(b),
+        string s => s,
+        _ => null,
+    };
 
     private void HandlePairSuccess(BinaryNode pairSuccess)
     {
