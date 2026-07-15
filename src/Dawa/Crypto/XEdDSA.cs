@@ -53,9 +53,23 @@ public static class XEdDSA
         a[0] &= 248; a[31] &= 127; a[31] |= 64;
         var aInt = LoadLE(a);
 
-        // 2. A = a × G  (Ed25519 public key derived from the scalar)
+        // 2. A = a × G  (Ed25519 public key derived from the scalar).
+        //    Signal XEdDSA calculate_key_pair REQUIRES the public key's sign bit to
+        //    be 0: if A = a·G encodes with sign bit 1, negate the scalar (a = L − a) so
+        //    A becomes −A, whose x-coordinate parity — and thus the sign bit — flips to
+        //    0. WhatsApp's verifier reconstructs A from the Montgomery public key with
+        //    sign bit 0, so without this the signature verifies only ~half the time and
+        //    silently fails the server-side signed-pre-key check during registration
+        //    (869e513va). r is derived from Ap below, so it is recomputed from the
+        //    corrected key automatically.
         var A  = PointMult(G, aInt);
         var Ap = PackPoint(A);
+        if ((Ap[31] & 0x80) != 0)
+        {
+            aInt = Fl(L - aInt);
+            A  = PointMult(G, aInt);
+            Ap = PackPoint(A); // sign bit is now 0
+        }
 
         // 3. r = SHA-512(A ‖ message) mod l
         var rHash = SHA512.HashData([.. Ap, .. message]);
