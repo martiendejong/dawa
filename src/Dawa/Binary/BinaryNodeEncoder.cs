@@ -99,8 +99,13 @@ public static class BinaryNodeEncoder
             return;
         }
 
-        // Try dictionary lookup first
-        if (WATags.TryGetToken(value, out var dictByte, out var idxByte))
+        // Single-byte token first (cheapest), then the double-byte dictionaries.
+        if (WATags.TryGetSingleByteToken(value, out var singleByte))
+        {
+            s.WriteByte(singleByte);
+            return;
+        }
+        if (WATags.TryGetDoubleByteToken(value, out var dictByte, out var idxByte))
         {
             s.WriteByte(dictByte);
             s.WriteByte(idxByte);
