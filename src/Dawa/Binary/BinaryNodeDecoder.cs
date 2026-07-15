@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Text;
 
 namespace Dawa.Binary;
@@ -9,7 +10,29 @@ public static class BinaryNodeDecoder
 {
     public static BinaryNode Decode(byte[] data)
     {
-        var reader = new BinaryReader(data);
+        // WhatsApp frames a binary node as [1 flag byte][node bytes]. The flag's bit 1
+        // (0x02) means the node bytes are zlib-compressed. Matches Baileys
+        // decompressingIfRequired: always strip byte 0, inflate the rest when 2 & flag.
+        // Without this the flag byte (typically 0x00) is read as part of the node and the
+        // decoder desyncs one byte in, later throwing "Unexpected string tag" (869e51uxu).
+        if (data.Length == 0)
+            throw new InvalidDataException("Empty binary frame.");
+
+        byte[] body;
+        if ((data[0] & 0x02) != 0)
+        {
+            using var input = new MemoryStream(data, 1, data.Length - 1);
+            using var zlib = new ZLibStream(input, CompressionMode.Decompress);
+            using var output = new MemoryStream();
+            zlib.CopyTo(output);
+            body = output.ToArray();
+        }
+        else
+        {
+            body = data[1..];
+        }
+
+        var reader = new BinaryReader(body);
         return ReadNode(ref reader);
     }
 
@@ -87,9 +110,17 @@ public static class BinaryNodeDecoder
         return reader.ReadBytes(length);
     }
 
+    // WAJIDDomains (Baileys jid-utils)
+    private const int DomainLid = 1, DomainHosted = 128, DomainHostedLid = 129;
+
     private static string ReadString(ref BinaryReader reader)
     {
         var b = reader.ReadByte();
+
+        // Bare single-byte token (Baileys: tag in [1, SINGLE_BYTE_TOKENS.length)).
+        var single = WATags.GetSingleByteToken(b);
+        if (single != null)
+            return single;
 
         if (b >= WATags.DictionaryBase && b <= WATags.DictionaryBase + 3)
         {
@@ -121,61 +152,90 @@ public static class BinaryNodeDecoder
             {
                 var user = ReadString(ref reader);
                 var server = ReadString(ref reader);
+                if (string.IsNullOrEmpty(server))
+                    throw new InvalidDataException("invalid jid pair");
                 return $"{user}@{server}";
             }
+            case WATags.AdJid:
+            {
+                var domainType = reader.ReadByte();
+                var device = reader.ReadByte();
+                var user = ReadString(ref reader);
+                var server = domainType switch
+                {
+                    DomainLid => "lid",
+                    DomainHosted => "hosted",
+                    DomainHostedLid => "hosted.lid",
+                    _ => "s.whatsapp.net",
+                };
+                return JidEncode(user, server, device);
+            }
+            case WATags.FbJid:
+            {
+                var user = ReadString(ref reader);
+                var device = reader.ReadUInt16BE();
+                var server = ReadString(ref reader);
+                return $"{user}:{device}@{server}";
+            }
+            case WATags.InteropJid:
+            {
+                var user = ReadString(ref reader);
+                var device = reader.ReadUInt16BE();
+                var integrator = reader.ReadUInt16BE();
+                var server = "interop";
+                var before = reader.Position;
+                try { server = ReadString(ref reader); }
+                catch { reader.Position = before; }
+                return $"{integrator}-{user}:{device}@{server}";
+            }
             case WATags.Nibble8:
-            {
-                var size = reader.ReadByte();
-                var negative = (size & 0x80) != 0;
-                size &= 0x7F;
-                var sb = new StringBuilder();
-                for (int i = 0; i < size; i++)
-                {
-                    var nibbleByte = reader.ReadByte();
-                    var hi = (nibbleByte >> 4) & 0xF;
-                    var lo = nibbleByte & 0xF;
-                    sb.Append(DecodeNibble(hi));
-                    if (!(negative && i == size - 1 && lo == 15))
-                        sb.Append(DecodeNibble(lo));
-                }
-                return sb.ToString();
-            }
+                return ReadPacked8(ref reader, WATags.Nibble8);
             case WATags.Hex8:
-            {
-                var size = reader.ReadByte();
-                var negative = (size & 0x80) != 0;
-                size &= 0x7F;
-                var sb = new StringBuilder();
-                for (int i = 0; i < size; i++)
-                {
-                    var hexByte = reader.ReadByte();
-                    var hi = (hexByte >> 4) & 0xF;
-                    var lo = hexByte & 0xF;
-                    sb.Append(DecodeHexNibble(hi));
-                    if (!(negative && i == size - 1 && lo == 15))
-                        sb.Append(DecodeHexNibble(lo));
-                }
-                return sb.ToString();
-            }
+                return ReadPacked8(ref reader, WATags.Hex8);
             default:
                 throw new InvalidDataException($"Unexpected string tag: {b:X2}");
         }
     }
 
-    private static char DecodeNibble(int n) => n switch
+    // Baileys readPacked8: append both nibbles per byte, then drop the last char when
+    // the length byte's high bit is set (odd-length marker).
+    private static string ReadPacked8(ref BinaryReader reader, byte tag)
     {
-        <= 9 => (char)('0' + n),
+        var startByte = reader.ReadByte();
+        var count = startByte & 0x7F;
+        var sb = new StringBuilder(count * 2);
+        for (int i = 0; i < count; i++)
+        {
+            var cur = reader.ReadByte();
+            sb.Append(UnpackByte(tag, (cur & 0xF0) >> 4));
+            sb.Append(UnpackByte(tag, cur & 0x0F));
+        }
+        if ((startByte >> 7) != 0 && sb.Length > 0)
+            sb.Length -= 1;
+        return sb.ToString();
+    }
+
+    private static char UnpackByte(byte tag, int v) =>
+        tag == WATags.Nibble8 ? UnpackNibble(v) : UnpackHex(v);
+
+    private static char UnpackNibble(int v) => v switch
+    {
+        >= 0 and <= 9 => (char)('0' + v),
         10 => '-',
         11 => '.',
-        12 => '\0',
-        13 => '\0',
-        14 => '\0',
         15 => '\0',
-        _ => (char)n
+        _ => throw new InvalidDataException($"invalid nibble: {v}"),
     };
 
-    private static char DecodeHexNibble(int n) =>
-        n < 10 ? (char)('0' + n) : (char)('A' + n - 10);
+    private static char UnpackHex(int v) => v switch
+    {
+        >= 0 and <= 9 => (char)('0' + v),
+        >= 10 and <= 15 => (char)('A' + v - 10),
+        _ => throw new InvalidDataException($"invalid hex: {v}"),
+    };
+
+    private static string JidEncode(string? user, string server, int device) =>
+        $"{user ?? ""}{(device != 0 ? $":{device}" : "")}@{server}";
 }
 
 /// <summary>Simple forward-only reader over a byte array.</summary>
@@ -185,7 +245,7 @@ internal ref struct BinaryReader
     private int _pos;
 
     public BinaryReader(byte[] data) { _data = data; _pos = 0; }
-    public int Position => _pos;
+    public int Position { readonly get => _pos; set => _pos = value; }
     public bool HasMore => _pos < _data.Length;
 
     public byte ReadByte() => _data[_pos++];

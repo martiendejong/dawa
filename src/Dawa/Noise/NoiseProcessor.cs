@@ -237,41 +237,56 @@ public sealed class NoiseProcessor : IAsyncDisposable
         }
         else if (type == "set")
         {
-            // Server is initiating a request (e.g., pair-device from server side)
+            // Server-initiated pair-device: ack it, then emit the QR (Baileys
+            // CB:iq,type:set,pair-device). The ack must go to the bare server JID
+            // '@s.whatsapp.net' (Baileys S_WHATSAPP_NET), NOT the stanza's from.
             var pairDevice = iq.FindChild("pair-device");
             if (pairDevice != null)
             {
-                // Respond with an ack
                 var ack = new BinaryNode("iq", new()
                 {
-                    ["id"] = iq.GetAttr("id") ?? "",
+                    ["to"] = "@s.whatsapp.net",
                     ["type"] = "result",
-                    ["to"] = iq.GetAttr("from") ?? "s.whatsapp.net",
+                    ["id"] = iq.GetAttr("id") ?? "",
                 });
                 await SendNodeAsync(ack, ct);
+                await HandlePairDeviceResultAsync(pairDevice, ct);
             }
         }
     }
 
-    private async Task HandlePairDeviceResultAsync(BinaryNode pairDevice, CancellationToken ct)
+    private Task HandlePairDeviceResultAsync(BinaryNode pairDevice, CancellationToken ct)
     {
-        // Extract ref token from server
+        // The pair-device node carries one or more <ref> children (the server rotates
+        // them). Emit the QR for the first; content is raw bytes, not a string.
         var refNode = pairDevice.FindChild("ref");
-        if (refNode?.Text == null) return;
-
-        var ref_ = refNode.Text;
-        var qrParts = new[]
+        var refText = RefText(refNode);
+        if (refText == null)
         {
-            ref_,
+            _logger.LogWarning("pair-device had no usable <ref>.");
+            return Task.CompletedTask;
+        }
+
+        // Classic linked-device QR payload: ref,noiseKeyB64,identityKeyB64,advSecretB64.
+        // (Some Baileys builds prefix a wa.me URL + companion platform id; if the phone
+        //  rejects this form at scan time, switch to that variant.)
+        var qrString = string.Join(",",
+            refText,
             Convert.ToBase64String(_auth.NoiseKeyPublic),
             Convert.ToBase64String(_auth.SignedIdentityKeyPublic),
-            Convert.ToBase64String(_auth.AdvSecretKey),
-        };
-        var qrString = string.Join(",", qrParts);
+            Convert.ToBase64String(_auth.AdvSecretKey));
 
-        _logger.LogInformation("QR Code ready for scanning.");
+        _logger.LogInformation("QR code ready for scanning.");
         QRCodeGenerated?.Invoke(this, qrString);
+        return Task.CompletedTask;
     }
+
+    private static string? RefText(BinaryNode? refNode) => refNode?.Content switch
+    {
+        byte[] b => Encoding.UTF8.GetString(b),
+        string s => s,
+        _ => null,
+    };
 
     private void HandlePairSuccess(BinaryNode pairSuccess)
     {
@@ -422,16 +437,18 @@ public sealed class NoiseProcessor : IAsyncDisposable
 
     // ─── Helpers ────────────────────────────────────────────────────────────
 
-    // Baileys default version: [2, 3000, 1015920]
-    // buildHash = MD5("2.3000.1015920")
-    private const string WA_VERSION = "2.3000.1015920";
+    // WhatsApp Web client version. WA may reject clients that are too old, so this
+    // tracks the current Baileys default (869ceb2t7). NOTE: this is a moving target —
+    // verify it is still current at test time against Baileys' Defaults WA_VERSION.
+    // buildHash = MD5("2.3000.1035194821")  (Baileys Defaults baileys-version.json, checked 2026-07-15)
+    private const string WA_VERSION = "2.3000.1035194821";
 
     private byte[] BuildClientPayload()
     {
         var userAgent = new UserAgent
         {
             Platform = 14, // WEB
-            AppVersion = new AppVersion { Primary = 2, Secondary = 3000, Tertiary = 1015920 },
+            AppVersion = new AppVersion { Primary = 2, Secondary = 3000, Tertiary = 1035194821 },
             Mcc = "000",
             Mnc = "000",
             OsVersion = "0.1",
@@ -459,13 +476,27 @@ public sealed class NoiseProcessor : IAsyncDisposable
             eSkeyId[1] = (byte)(_auth.SignedPreKeyId >> 8);
             eSkeyId[2] = (byte)(_auth.SignedPreKeyId);
 
-            var deviceProps = new DevicePropsMessage
+            // Use the DevicePropsMessage default os (Macintosh, 869ceb3w5); the previous
+            // hard-coded Os="Windows" here silently overrode that fix on the one code
+            // path that actually ships in the registration payload.
+            var devicePropsMsg = new DevicePropsMessage
             {
-                Os = "Windows",
                 PlatformType = 1, // CHROME
-            }.ToByteArray();
+            };
+            var deviceProps = devicePropsMsg.ToByteArray();
 
-            return new ClientPayload
+            var pairing = new DevicePairingRegistrationData
+            {
+                ERegid   = eRegid,
+                EKeytype = [5], // KEY_BUNDLE_TYPE
+                EIdent   = _auth.SignedIdentityKeyPublic,
+                ESkeyId  = eSkeyId,
+                ESkeyVal = _auth.SignedPreKeyPublic,
+                ESkeySig = _auth.SignedPreKeySignature,
+                BuildHash   = buildHash,
+                DeviceProps = deviceProps,
+            };
+            var payload = new ClientPayload
             {
                 Passive = false,
                 Pull = false,
@@ -473,18 +504,32 @@ public sealed class NoiseProcessor : IAsyncDisposable
                 ConnectReason = 1, // USER_ACTIVATED
                 UserAgent = userAgent,
                 WebInfo = new WebInfo { WebSubPlatform = 0 },
-                DevicePairingData = new DevicePairingRegistrationData
-                {
-                    ERegid   = eRegid,
-                    EKeytype = [5], // KEY_BUNDLE_TYPE
-                    EIdent   = _auth.SignedIdentityKeyPublic,
-                    ESkeyId  = eSkeyId,
-                    ESkeyVal = _auth.SignedPreKeyPublic,
-                    ESkeySig = _auth.SignedPreKeySignature,
-                    BuildHash   = buildHash,
-                    DeviceProps = deviceProps,
-                },
+                DevicePairingData = pairing,
             }.ToByteArray();
+
+            // 869e513va: WhatsApp closes the connection after a successful handshake if it
+            // rejects this registration ClientPayload. Log the exact fields + wire bytes so
+            // they can be diffed against Baileys' generateRegistrationNode. Debug-level, so
+            // it stays silent in normal runs.
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                _logger.LogDebug(
+                    "RegPayload: waVersion={V} buildHash={BH} regId={RID} skeyId={SID} os={OS} platformType={PT} " +
+                    "eIdent[{IL}] eSkeyVal[{SVL}] eSkeySig[{SSL}] deviceProps[{DPL}]={DPHEX} clientPayload[{CPL}]={CPHEX}",
+                    WA_VERSION,
+                    Convert.ToHexString(buildHash),
+                    _auth.RegistrationId,
+                    _auth.SignedPreKeyId,
+                    devicePropsMsg.Os,
+                    devicePropsMsg.PlatformType,
+                    _auth.SignedIdentityKeyPublic.Length,
+                    _auth.SignedPreKeyPublic.Length,
+                    _auth.SignedPreKeySignature.Length,
+                    deviceProps.Length, Convert.ToHexString(deviceProps),
+                    payload.Length, Convert.ToHexString(payload));
+            }
+
+            return payload;
         }
         else
         {

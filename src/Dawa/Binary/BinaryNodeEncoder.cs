@@ -10,6 +10,10 @@ public static class BinaryNodeEncoder
     public static byte[] Encode(BinaryNode node)
     {
         var ms = new MemoryStream();
+        // WhatsApp frames a node as [1 flag byte][node bytes]; 0x00 = uncompressed.
+        // Baileys' encodeBinaryNode seeds its buffer with [0] for the same reason. The
+        // decoder strips this byte, so a node sent without it desyncs the peer (869e51uxu).
+        ms.WriteByte(0x00);
         WriteNode(ms, node);
         return ms.ToArray();
     }
@@ -95,22 +99,32 @@ public static class BinaryNodeEncoder
             return;
         }
 
-        // Try dictionary lookup first
-        if (WATags.TryGetToken(value, out var dictByte, out var idxByte))
+        // Single-byte token first (cheapest), then the double-byte dictionaries.
+        if (WATags.TryGetSingleByteToken(value, out var singleByte))
+        {
+            s.WriteByte(singleByte);
+            return;
+        }
+        if (WATags.TryGetDoubleByteToken(value, out var dictByte, out var idxByte))
         {
             s.WriteByte(dictByte);
             s.WriteByte(idxByte);
             return;
         }
 
-        // Check if it's a JID (user@server)
+        // JID (user@server). Detect the '@' anywhere INCLUDING position 0 — server JIDs
+        // like "@s.whatsapp.net" have an empty user and must still be encoded as a
+        // JID_PAIR (empty user -> LIST_EMPTY), matching Baileys writeJid. Encoding such a
+        // JID as a raw string makes WhatsApp reject the stanza with a stream:error
+        // (this was breaking the pair-device ack, 869e51uxu). Device JIDs (user:device@server)
+        // are left to the raw path for now — the pairing/ack flow only uses bare server JIDs.
         var atIdx = value.IndexOf('@');
-        if (atIdx > 0)
+        if (atIdx >= 0 && !value.Contains(':'))
         {
             var user = value[..atIdx];
             var server = value[(atIdx + 1)..];
             s.WriteByte(WATags.JidPair);
-            WriteString(s, user);
+            WriteString(s, user); // empty user -> ListEmpty (WriteString handles "")
             WriteString(s, server);
             return;
         }
