@@ -95,20 +95,42 @@ public static class BinaryNodeEncoder
             return;
         }
 
-        // Try dictionary lookup first
-        if (WATags.TryGetToken(value, out var dictByte, out var idxByte))
+        // Try single-byte token first (1 byte)
+        if (WATags.TryGetSingleByteToken(value, out var singleByte))
+        {
+            s.WriteByte(singleByte);
+            return;
+        }
+
+        // Try double-byte token (2 bytes: DictionaryBase+dict, index)
+        if (WATags.TryGetDoubleByteToken(value, out var dictByte, out var idxByte))
         {
             s.WriteByte(dictByte);
             s.WriteByte(idxByte);
             return;
         }
 
-        // Check if it's a JID (user@server)
+        // Check if it's a JID (user@server or @server with empty user)
         var atIdx = value.IndexOf('@');
-        if (atIdx > 0)
+        if (atIdx >= 0)
         {
             var user = value[..atIdx];
             var server = value[(atIdx + 1)..];
+
+            // Check if this is an AD-JID (multi-device) with format "user:device@server"
+            var colonIdx = user.IndexOf(':');
+            if (colonIdx >= 0 && int.TryParse(user[(colonIdx + 1)..], out var deviceId))
+            {
+                var baseUser = user[..colonIdx];
+                // AD_JID format: tag(247) + domainType + device + writeString(user)
+                byte domainType = server == "lid" ? (byte)1 : (byte)0;
+                s.WriteByte(WATags.AdJid);
+                s.WriteByte(domainType);
+                s.WriteByte((byte)deviceId);
+                WriteString(s, baseUser);
+                return;
+            }
+
             s.WriteByte(WATags.JidPair);
             WriteString(s, user);
             WriteString(s, server);

@@ -114,11 +114,15 @@ public static class AesGcmHelper
 
     private static byte[] CounterToNonce(ulong counter)
     {
-        // 12-byte nonce: 4 zero bytes + 8-byte big-endian counter
+        // Noise spec: 12-byte nonce, counter as 4-byte big-endian uint32 at offset 8.
+        // Baileys noise.ts: nonce.writeUInt32BE(counter, 8)
+        // Bytes 0-7 = zero, bytes 8-11 = counter (big-endian uint32)
         var nonce = new byte[NonceSize];
-        var counterBytes = BitConverter.GetBytes(counter);
-        if (BitConverter.IsLittleEndian) Array.Reverse(counterBytes);
-        counterBytes.CopyTo(nonce, 4);
+        var c = (uint)counter;
+        nonce[8]  = (byte)(c >> 24);
+        nonce[9]  = (byte)(c >> 16);
+        nonce[10] = (byte)(c >> 8);
+        nonce[11] = (byte)(c);
         return nonce;
     }
 }

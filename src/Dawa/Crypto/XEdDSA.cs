@@ -43,37 +43,94 @@ public static class XEdDSA
     // ─── Public API ───────────────────────────────────────────────────────
 
     /// <summary>
+    /// Verifies an XEdDSA signature.
+    /// <paramref name="curve25519PublicKey"/> is the 32-byte Curve25519 (Montgomery x) public key.
+    /// </summary>
+    public static bool Verify(byte[] curve25519PublicKey, byte[] message, byte[] signature)
+    {
+        if (signature.Length != 64) return false;
+
+        // 1. Convert Curve25519 Montgomery x → Edwards y:  y = (u-1)/(u+1) mod p
+        var u  = LoadLE(curve25519PublicKey);
+        var y  = Fp((u - 1) * FpInv(u + 1));
+
+        // 2. Recover Edwards x from y (positive/even root)
+        var y2 = Fp(y * y);
+        var x2 = Fp((y2 - 1) * FpInv(Fp(D * y2 + 1)));
+        var ax  = FpSqrt(x2);
+        if (!ax.IsEven) ax = P - ax;
+        var A = (ax, y);
+        var Ap = PackPoint(A);
+
+        // 3. Parse R (packed point) and s from signature
+        var Rp    = signature[0..32];
+        var sBuf  = signature[32..64];
+        var s     = LoadLE(sBuf);
+        if (s >= L) return false;
+
+        // 4. Unpack R
+        var Rbuf  = (byte[])Rp.Clone();
+        var Rsign = (Rbuf[31] & 0x80) != 0;
+        Rbuf[31] &= 0x7F;
+        var Ry  = LoadLE(Rbuf);
+        var Ry2 = Fp(Ry * Ry);
+        var Rx2 = Fp((Ry2 - 1) * FpInv(Fp(D * Ry2 + 1)));
+        var Rx  = FpSqrt(Rx2);
+        if (Rsign != !Rx.IsEven) Rx = P - Rx;
+        var R = (Rx, Ry);
+
+        // 5. h = SHA-512(R ‖ A ‖ message) mod l
+        var hHash = SHA512.HashData([.. Rp, .. Ap, .. message]);
+        var h     = Fl(LoadLE64(hHash));
+
+        // 6. s·G == R + h·A
+        var lhs = PointMult(G, s);
+        var rhs = PointAdd(R, PointMult(A, h));
+        return lhs.X == rhs.X && lhs.Y == rhs.Y;
+    }
+
+    /// <summary>
     /// Signs <paramref name="message"/> using XEdDSA with the given 32-byte
     /// Curve25519 private key. Returns a 64-byte signature (R ‖ s).
     /// </summary>
     public static byte[] Sign(byte[] privateKey, byte[] message)
     {
         // 1. Clamp Curve25519 private key → Ed25519 scalar a
-        var a = (byte[])privateKey.Clone();
-        a[0] &= 248; a[31] &= 127; a[31] |= 64;
-        var aInt = LoadLE(a);
+        var aClamped = (byte[])privateKey.Clone();
+        aClamped[0] &= 248; aClamped[31] &= 127; aClamped[31] |= 64;
+        var aInt = LoadLE(aClamped);
 
         // 2. A = a × G  (Ed25519 public key derived from the scalar)
-        var A  = PointMult(G, aInt);
-        var Ap = PackPoint(A);
+        var A = PointMult(G, aInt);
 
-        // 3. r = SHA-512(A ‖ message) mod l
-        var rHash = SHA512.HashData([.. Ap, .. message]);
+        // 3. XEdDSA sign convention: A must have a non-negative (even) x-coordinate.
+        //    Verifiers recover A from the Curve25519 key using always the positive x root.
+        //    If our A.x is negative (odd), negate the scalar so A becomes -A (same y, flipped x).
+        if (!A.X.IsEven)
+        {
+            aInt = Fl(L - aInt);          // negate scalar mod l
+            A    = (Fp(P - A.X), A.Y);   // flip x sign (same point, opposite x sign)
+        }
+        var Ap = PackPoint(A); // bit 255 of Ap is now always 0
+
+        // 4. r = SHA-512(a ‖ message ‖ Z) mod l  (Signal XEdDSA nonce, using final scalar)
+        var aBytes = ToLE32(aInt);
+        var Z      = System.Security.Cryptography.RandomNumberGenerator.GetBytes(64);
+        var rHash  = SHA512.HashData([.. aBytes, .. message, .. Z]);
         var r     = Fl(LoadLE64(rHash));
-        var rBytes = ToLE32(r);
 
-        // 4. R = r × G
+        // 5. R = r × G
         var R  = PointMult(G, r);
         var Rp = PackPoint(R);
 
-        // 5. h = SHA-512(R ‖ A ‖ message) mod l
+        // 6. h = SHA-512(R ‖ A ‖ message) mod l
         var hHash = SHA512.HashData([.. Rp, .. Ap, .. message]);
         var h     = Fl(LoadLE64(hHash));
 
-        // 6. s = (r + h·a) mod l
+        // 7. s = (r + h·a) mod l
         var s = Fl(r + h * aInt);
 
-        // 7. Signature = R (32 bytes) ‖ s (32 bytes)
+        // 8. Signature = R (32 bytes) ‖ s (32 bytes)
         var sig = new byte[64];
         Rp.CopyTo(sig, 0);
         ToLE32(s).CopyTo(sig, 32);

@@ -32,7 +32,12 @@ public sealed class SessionStore
             var state = JsonSerializer.Deserialize<AuthState>(json, _jsonOpts);
             if (state != null) return state;
         }
-        return AuthState.CreateNew();
+        // No saved session — generate fresh keys and save immediately.
+        // This ensures reconnects during QR phase (before pairing) reuse the same keys
+        // that were encoded in the QR, so the phone can pair successfully.
+        var fresh = AuthState.CreateNew();
+        await SaveAsync(fresh, ct);
+        return fresh;
     }
 
     /// <summary>Saves the current auth state to disk.</summary>
