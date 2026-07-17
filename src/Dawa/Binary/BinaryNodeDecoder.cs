@@ -87,10 +87,22 @@ public static class BinaryNodeDecoder
         return reader.ReadBytes(length);
     }
 
+    // Sentinel returned when ReadString encounters StreamEnd (byte 0x02).
+    internal const string StreamEndSentinel = "\x02";
+
     private static string ReadString(ref BinaryReader reader)
     {
         var b = reader.ReadByte();
 
+        // StreamEnd byte — signals server closed the stream.
+        if (b == WATags.StreamEnd)
+            return StreamEndSentinel;
+
+        // Single-byte tokens: byte value IS the index into SingleByteTokens (Baileys convention).
+        if (b >= 1 && b < WATags.DictionaryBase)
+            return WATags.GetSingleByteToken(b) ?? $"[TOKEN{b}]";
+
+        // Double-byte tokens: next byte is the index into the chosen dictionary.
         if (b >= WATags.DictionaryBase && b <= WATags.DictionaryBase + 3)
         {
             int dictIndex = b - WATags.DictionaryBase;
@@ -122,6 +134,25 @@ public static class BinaryNodeDecoder
                 var user = ReadString(ref reader);
                 var server = ReadString(ref reader);
                 return $"{user}@{server}";
+            }
+            case WATags.AdJid:
+            {
+                // AD_JID (0xF7): domainType byte + device byte + user string
+                // Baileys: readAdJid() in decode.js
+                var domainType = reader.ReadByte();
+                var device = reader.ReadByte();
+                var user = ReadString(ref reader);
+                var server = (domainType == 0 || domainType == 128) ? "s.whatsapp.net" : "lid";
+                return device == 0 ? $"{user}@{server}" : $"{user}:{device}@{server}";
+            }
+            case WATags.InteropJid:
+            case WATags.FbJid:
+            {
+                // Consume bytes to stay in sync, return placeholder
+                var domainType = reader.ReadByte();
+                var device = reader.ReadByte();
+                var user = ReadString(ref reader);
+                return $"{user}@fb";
             }
             case WATags.Nibble8:
             {

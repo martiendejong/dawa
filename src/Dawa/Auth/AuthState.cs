@@ -53,6 +53,13 @@ public sealed class AuthState
     [JsonPropertyName("lastAccountSyncTimestamp")]
     public long LastAccountSyncTimestamp { get; set; }
 
+    /// <summary>
+    /// ADVSignedDeviceIdentity protobuf bytes (set during QR pairing).
+    /// Used for device-identity node when sending pkmsg.
+    /// </summary>
+    [JsonPropertyName("account")]
+    public byte[]? Account { get; set; }
+
     /// <summary>True if this is a fresh (unauthenticated) state.</summary>
     [JsonIgnore]
     public bool IsFresh => Me == null;
@@ -96,9 +103,13 @@ public sealed class AuthState
     private static byte[] SignPreKey(byte[] identityPriv, byte[] preKeyPub)
     {
         // XEdDSA: uses the Curve25519 identity private key directly as an Ed25519 scalar.
-        // This matches Baileys / Signal's curve25519-js curve25519_sign() behaviour.
+        // WhatsApp requires signing the 33-byte KEY_BUNDLE_TYPE form: [0x05 || pubKey].
+        // Baileys signedPreKey: curve.sign(identityKey.private, Buffer.concat([Buffer.from([5]), signedPreKey.public]))
         // Returns a 64-byte signature (R ‖ s).
-        return XEdDSA.Sign(identityPriv, preKeyPub);
+        var message = new byte[33];
+        message[0] = 0x05; // KEY_BUNDLE_TYPE
+        preKeyPub.CopyTo(message, 1);
+        return XEdDSA.Sign(identityPriv, message);
     }
 }
 

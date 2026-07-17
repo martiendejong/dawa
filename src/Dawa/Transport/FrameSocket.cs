@@ -6,12 +6,20 @@ namespace Dawa.Transport;
 /// <summary>
 /// WebSocket wrapper that adds WhatsApp's 3-byte big-endian length framing.
 /// Each frame: [length: 3 bytes BE] [payload: N bytes]
+///
+/// A single WebSocket message may contain multiple WA frames back-to-back
+/// (Baileys: noise-handler.ts processData drains all frames in a loop).
+/// We buffer leftover bytes so each ReceiveFrameAsync call returns exactly one frame.
 /// </summary>
 public sealed class FrameSocket : IAsyncDisposable
 {
     private readonly ILogger _logger;
     private ClientWebSocket? _ws;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+
+    // Buffer for bytes received but not yet returned as a complete frame
+    private byte[] _recvBuf = [];
+    private int _recvLen = 0;
 
     // WhatsApp server URL
     private const string WA_URL = "wss://web.whatsapp.com/ws/chat";
@@ -23,7 +31,7 @@ public sealed class FrameSocket : IAsyncDisposable
 
     public bool IsConnected => _ws?.State == WebSocketState.Open;
 
-    public async Task ConnectAsync(string? url = null, CancellationToken ct = default)
+    public async Task ConnectAsync(string? url = null, byte[]? routingInfo = null, CancellationToken ct = default)
     {
         _ws = new ClientWebSocket();
         _ws.Options.SetRequestHeader("Origin", "https://web.whatsapp.com");
@@ -36,6 +44,14 @@ public sealed class FrameSocket : IAsyncDisposable
         // Sub-protocol is required by WhatsApp's server
         _ws.Options.AddSubProtocol("chat");
         _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(25);
+
+        // When WhatsApp sends edge_routing, reconnect to the preferred edge server
+        // by including the X-WA-Routing header (Baileys: socket.ts fetchOptions.headers)
+        if (routingInfo != null && routingInfo.Length > 0)
+        {
+            _ws.Options.SetRequestHeader("X-WA-Routing", Convert.ToBase64String(routingInfo));
+            _logger.LogInformation("FrameSocket: Connecting with X-WA-Routing ({Len} bytes).", routingInfo.Length);
+        }
 
         await _ws.ConnectAsync(new Uri(url ?? WA_URL), ct);
         _logger.LogInformation("FrameSocket: WebSocket connected to {Url}", url ?? WA_URL);
@@ -85,40 +101,74 @@ public sealed class FrameSocket : IAsyncDisposable
         _logger.LogDebug("FrameSocket: Sent frame {Length} bytes", payload.Length);
     }
 
-    /// <summary>Reads the next frame from the WebSocket, stripping the 3-byte header.</summary>
+    /// <summary>
+    /// Reads the next WA frame. If the receive buffer already contains a complete
+    /// frame (leftover from a previous WebSocket message), returns it immediately
+    /// without touching the network. Otherwise reads one WebSocket message and
+    /// appends it to the buffer, then extracts the first complete frame.
+    /// Matches Baileys noise-handler.ts processData drain-loop behaviour.
+    /// </summary>
     public async Task<byte[]?> ReceiveFrameAsync(CancellationToken ct = default)
     {
-        if (_ws == null || _ws.State != WebSocketState.Open)
-            return null;
-
-        using var ms = new MemoryStream();
-        var buffer = new byte[65536];
-        WebSocketReceiveResult result;
-
-        do
+        while (true)
         {
-            result = await _ws.ReceiveAsync(buffer, ct);
-            if (result.MessageType == WebSocketMessageType.Close)
+            // Try to extract a complete WA frame from the existing buffer
+            if (_recvLen >= 3)
             {
-                _logger.LogInformation("FrameSocket: Server sent close frame.");
-                return null;
+                var length = (_recvBuf[0] << 16) | (_recvBuf[1] << 8) | _recvBuf[2];
+                if (_recvLen >= 3 + length)
+                {
+                    var payload = _recvBuf[3..(3 + length)];
+                    // Shift remaining bytes to the front
+                    var remaining = _recvLen - (3 + length);
+                    if (remaining > 0)
+                        Buffer.BlockCopy(_recvBuf, 3 + length, _recvBuf, 0, remaining);
+                    _recvLen = remaining;
+                    _logger.LogDebug("FrameSocket: Extracted frame {Length} bytes (buf remaining={Rem})", length, remaining);
+                    return payload;
+                }
             }
-            ms.Write(buffer, 0, result.Count);
-        } while (!result.EndOfMessage);
 
-        var raw = ms.ToArray();
-        if (raw.Length < 3) return null;
+            // Need more data — read one WebSocket message
+            if (_ws == null || _ws.State != WebSocketState.Open)
+                return null;
 
-        var length = (raw[0] << 16) | (raw[1] << 8) | raw[2];
-        if (raw.Length < 3 + length)
-        {
-            _logger.LogWarning("FrameSocket: Frame length mismatch: header says {Expected}, got {Actual}", length, raw.Length - 3);
-            return null;
+            using var ms = new MemoryStream();
+            var wsBuffer = new byte[65536];
+            WebSocketReceiveResult result;
+
+            do
+            {
+                result = await _ws.ReceiveAsync(wsBuffer, ct);
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    _logger.LogInformation("FrameSocket: Server sent close frame.");
+                    return null;
+                }
+                ms.Write(wsBuffer, 0, result.Count);
+            } while (!result.EndOfMessage);
+
+            var incoming = ms.ToArray();
+            _logger.LogInformation("FrameSocket: Raw receive {Length} bytes, type={Type}", incoming.Length, result.MessageType);
+
+            // Append incoming to receive buffer
+            EnsureCapacity(incoming.Length);
+            Buffer.BlockCopy(incoming, 0, _recvBuf, _recvLen, incoming.Length);
+            _recvLen += incoming.Length;
+            // Loop back up to try extracting a frame
         }
+    }
 
-        var payload = raw[3..(3 + length)];
-        _logger.LogDebug("FrameSocket: Received frame {Length} bytes", length);
-        return payload;
+    private void EnsureCapacity(int additional)
+    {
+        var needed = _recvLen + additional;
+        if (_recvBuf.Length < needed)
+        {
+            var newBuf = new byte[Math.Max(needed, _recvBuf.Length * 2 + additional)];
+            if (_recvLen > 0)
+                Buffer.BlockCopy(_recvBuf, 0, newBuf, 0, _recvLen);
+            _recvBuf = newBuf;
+        }
     }
 
     public async ValueTask DisposeAsync()

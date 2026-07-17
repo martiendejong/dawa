@@ -122,6 +122,8 @@ public ref struct ProtoReader
         int shift = 0;
         while (true)
         {
+            if (_pos >= _data.Length)
+                throw new InvalidDataException($"Protobuf varint read past end of buffer at pos={_pos}, len={_data.Length}");
             var b = _data[_pos++];
             result |= ((ulong)(b & 0x7F)) << shift;
             if ((b & 0x80) == 0) break;
@@ -133,6 +135,11 @@ public ref struct ProtoReader
     public byte[] ReadBytes()
     {
         var len = (int)ReadVarint();
+        if (len < 0 || _pos + len > _data.Length)
+        {
+            _pos = _data.Length; // stop parsing gracefully
+            return [];
+        }
         var data = _data[_pos..(_pos + len)];
         _pos += len;
         return data;
@@ -150,9 +157,26 @@ public ref struct ProtoReader
         switch (wireType)
         {
             case 0: ReadVarint(); break;
-            case 1: _pos += 8; break;
-            case 2: _pos += (int)ReadVarint(); break;
-            case 5: _pos += 4; break;
+            case 1:
+                if (_pos + 8 > _data.Length) { _pos = _data.Length; break; }
+                _pos += 8; break;
+            case 2:
+                var len2 = (int)ReadVarint();
+                if (len2 < 0 || _pos + len2 > _data.Length) { _pos = _data.Length; break; }
+                _pos += len2; break;
+            case 5:
+                if (_pos + 4 > _data.Length) { _pos = _data.Length; break; }
+                _pos += 4; break;
+            case 3: // SGROUP: skip until matching EGROUP (wire type 4)
+                while (HasMore)
+                {
+                    var (_, wt) = ReadTag();
+                    if (wt == 4) break; // EGROUP
+                    Skip(wt);
+                }
+                break;
+            case 4: break; // EGROUP — consumed by parent SGROUP skip
+            default: _pos = _data.Length; break; // unknown wire type — stop parsing this message
         }
     }
 }
